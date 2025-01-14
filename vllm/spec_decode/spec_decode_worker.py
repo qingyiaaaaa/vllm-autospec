@@ -1,4 +1,4 @@
-import copy
+import copy,time
 from collections import defaultdict
 from functools import cached_property
 from typing import Any, Dict, List, Optional, Set, Tuple, Type
@@ -89,6 +89,83 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
         ngram_prompt_lookup_min=speculative_config.ngram_prompt_lookup_min,
     )
 
+    auto_spec_workers_kwargs = {}
+    
+    if speculative_config.autospec_enable:
+        for method in speculative_config.autospec_config:
+            if method == "ssm":
+                auto_draft_worker_kwargs = copy.deepcopy(kwargs)
+                auto_draft_worker_config = copy.deepcopy(vllm_config)
+                
+                #create the vllmconfig object for the draft model
+                
+                auto_draft_model_config = ModelConfig(
+                    model=speculative_config.autospec_config[method],
+                    task="draft",
+                    tokenizer=target_worker_config.model_config.tokenizer,
+                    tokenizer_mode=target_worker_config.model_config.tokenizer_mode,
+                    trust_remote_code=target_worker_config.model_config.trust_remote_code,
+                    allowed_local_media_path=target_worker_config.model_config.allowed_local_media_path,
+                    dtype=target_worker_config.model_config.dtype,
+                    seed=target_worker_config.model_config.seed,
+                    revision=None,
+                    code_revision=None,
+                    tokenizer_revision=target_worker_config.model_config.tokenizer_revision,
+                    max_model_len=None,
+                    spec_target_max_model_len=target_worker_config.model_config.max_model_len,
+                    quantization=target_worker_config.model_config.quantization,
+                    enforce_eager=target_worker_config.model_config.enforce_eager,
+                    max_seq_len_to_capture=target_worker_config.model_config.
+                    max_seq_len_to_capture,
+                    max_logprobs=target_worker_config.model_config.max_logprobs,
+                )
+                
+                auto_draft_worker_config.model_config = auto_draft_model_config
+                
+                auto_draft_worker_config.quant_config = VllmConfig._get_quantization_config(
+                    auto_draft_worker_config.model_config,
+                    vllm_config.load_config,
+                )
+
+                auto_draft_worker_config.parallel_config = speculative_config.draft_parallel_config  # noqa
+                # TODO allow draft-model specific load config.
+                
+                # Override draft-model specific worker args.
+                auto_draft_worker_kwargs.update(
+                    vllm_config=auto_draft_worker_config,
+                    ngram_prompt_lookup_max=0,
+                    ngram_prompt_lookup_min=0,
+                )
+                
+                auto_spec_workers_kwargs[method] = auto_draft_worker_kwargs 
+            elif method == "ngram":
+                auto_draft_worker_kwargs = copy.deepcopy(kwargs)
+                auto_draft_worker_config = copy.deepcopy(vllm_config)
+                
+                #create the vllmconfig object for the draft model
+                
+                auto_draft_model_config = target_worker_config.model_config
+                auto_draft_parallel_config = target_worker_config.parallel_config
+                
+                auto_draft_worker_config.model_config = auto_draft_model_config
+                
+                auto_draft_worker_config.quant_config = VllmConfig._get_quantization_config(
+                    auto_draft_worker_config.model_config,
+                    vllm_config.load_config,
+                )
+
+                auto_draft_worker_config.parallel_config = speculative_config.draft_parallel_config  # noqa
+                # TODO allow draft-model specific load config.
+                
+                # Override draft-model specific worker args.
+                auto_draft_worker_kwargs.update(
+                    vllm_config=auto_draft_worker_config,
+                    ngram_prompt_lookup_max=speculative_config.autospec_config[method][1],
+                    ngram_prompt_lookup_min=speculative_config.autospec_config[method][0],
+                )
+                
+                auto_spec_workers_kwargs[method] = auto_draft_worker_kwargs 
+
     spec_decode_worker = SpecDecodeWorker.create_worker(
         scorer_worker=target_worker,
         draft_worker_kwargs=draft_worker_kwargs,
@@ -103,6 +180,9 @@ def create_spec_worker(*args, **kwargs) -> "SpecDecodeWorker":
         typical_acceptance_sampler_posterior_alpha,
         disable_logprobs=speculative_config.disable_logprobs,
         disable_log_stats=speculative_config.disable_log_stats,
+        autospec_enable=speculative_config.autospec_enable,
+        autospec_initsteps = speculative_config.autospec_initsteps,
+        autospec_workers_kwargs=auto_spec_workers_kwargs,
     )
 
     return spec_decode_worker
@@ -148,8 +228,52 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         typical_acceptance_sampler_posterior_alpha: float,
         disable_logprobs: bool,
         disable_log_stats: bool,
+        autospec_enable: bool,
+        autospec_initsteps: int,
+        autospec_workers_kwargs: Dict[str, Any],
     ) -> "SpecDecodeWorker":
 
+        remote_draft_server = RemoteServer()
+        remote_draft_server.setup_env(0,0,1,21928,autospec_initsteps)
+        if autospec_enable:
+            for method in autospec_workers_kwargs:
+                method_worker_kwargs = autospec_workers_kwargs[method]
+                allow_zero_draft_token_step = True
+                
+                ngram_prompt_lookup_max = method_worker_kwargs["ngram_prompt_lookup_max"]
+                ngram_prompt_lookup_min = method_worker_kwargs["ngram_prompt_lookup_min"]
+                method_model_config = method_worker_kwargs["vllm_config"].model_config
+                method_parallel_config: ParallelConfig = method_worker_kwargs[
+                    'vllm_config'].parallel_config
+                if ngram_prompt_lookup_max > 0:
+                    method_worker_kwargs[
+                        "device_type"] = scorer_worker.device_config.device.type
+                    remote_draft_server.init_worker(method, method_worker_kwargs)
+                else:
+                    draft_tp = method_parallel_config.tensor_parallel_size
+                    target_tp = scorer_worker.parallel_config.tensor_parallel_size
+
+                    ngram_prompt_lookup_max = (
+                        method_worker_kwargs.pop("ngram_prompt_lookup_max"))
+                    ngram_prompt_lookup_min = (
+                        method_worker_kwargs.pop("ngram_prompt_lookup_min"))
+
+                    if draft_tp == 1:
+                        if current_platform.is_cuda_alike():
+                            method_worker_kwargs[
+                                "model_runner_cls"] = TP1DraftModelRunner
+                    else:
+                        if method_model_config.hf_config.model_type == "eagle":
+                            raise NotImplementedError(
+                                "EAGLE does not support TP > 1 yet")
+
+                        allow_zero_draft_token_step = False
+                    
+                    method_worker_kwargs["draft_tp"] = draft_tp
+                    method_worker_kwargs["target_tp"] = target_tp
+                    
+                    remote_draft_server.init_worker(method, method_worker_kwargs)
+        
         allow_zero_draft_token_step = True
         ngram_prompt_lookup_max = (
             draft_worker_kwargs.pop("ngram_prompt_lookup_max"))
@@ -235,7 +359,11 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
             disable_log_stats=disable_log_stats,
             disable_by_batch_size=disable_by_batch_size,
             spec_decode_sampler=spec_decode_sampler,
-            allow_zero_draft_token_step=allow_zero_draft_token_step)
+            allow_zero_draft_token_step=allow_zero_draft_token_step,
+            autospec_enable=autospec_enable,
+            autospec_initsteps=autospec_initsteps,
+            remote_draft_server=remote_draft_server,
+            autospec_workers_kwargs=autospec_workers_kwargs)
 
     def __init__(
         self,
@@ -248,6 +376,10 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         metrics_collector: Optional[AsyncMetricsCollector] = None,
         disable_by_batch_size: Optional[int] = None,
         allow_zero_draft_token_step: Optional[bool] = True,
+        autospec_enable: bool = False,
+        autospec_initsteps: int = 100,
+        remote_draft_server: RemoteServer = None,
+        autospec_workers_kwargs: Dict[str, Any] = None,
     ):
         """
         Create a SpecDecodeWorker.
@@ -311,6 +443,14 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         self._disable_logprobs = disable_logprobs
         self._disable_log_stats = disable_log_stats
 
+        self.autospec_workers_kwargs = autospec_workers_kwargs
+        self.autospec_enable = autospec_enable
+        self.autospec_initsteps = autospec_initsteps
+        self.remote_draft_server = remote_draft_server
+        self.autospec_steps = 0
+        self.scorer_probs = []
+
+    
     def init_device(self) -> None:
         """Initialize both scorer and proposer models.
         """
@@ -488,12 +628,90 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         self._maybe_disable_speculative_tokens(
             disable_all_speculation, execute_model_req.seq_group_metadata_list)
 
+        if self.autospec_enable:
+            if self.autospec_steps < self.autospec_initsteps:
+                # With prefill chunking, expect requests to have prompts first
+                # so that backend gets prefill|decode.
+                assert num_lookahead_slots == execute_model_req.num_lookahead_slots
+
+                # Pass last hidden states from target model to proposer
+                execute_model_req.previous_hidden_states = self.previous_hidden_states
+                self.previous_hidden_states = None
+                self.remote_draft_server.run_cmd(autospec_step=self.autospec_steps,
+                                                 execute_model_req=execute_model_req, 
+                                                 seq_with_bonus_token_in_last_step=self._seq_with_bonus_token_in_last_step)
+                execute_model_req.previous_hidden_states = None
+
+                returnans , single_step_probs, target_model_time = self._run_no_spec(
+                    execute_model_req,
+                    skip_proposer=disable_all_speculation,
+                    autospec_no_spec = True
+                )
+                self.scorer_probs.append([single_step_probs,target_model_time])
+                self.autospec_steps += 1
+                return returnans
+                
+            elif self.autospec_steps == self.autospec_initsteps:
+                proposers_results = self.remote_draft_server.get_all_results()
+                choose_method, best_speedup = self.choose_autospec_method(scorer_probs = self.scorer_probs,
+                                                            proposers_results = proposers_results)
+                print(f"the spec metod {choose_method} has been chosen")
+                self.autospec_steps += 1
+            else:
+                pass
+                self.autospec_steps += 1
+        
         if no_spec:
             return self._run_no_spec(execute_model_req,
                                      skip_proposer=disable_all_speculation)
         return self._run_speculative_decoding_step(execute_model_req,
                                                    num_lookahead_slots)
 
+    def choose_autospec_method(
+        self,
+        scorer_probs,
+        proposers_results
+    ):
+        best_method = None
+        best_speedup = float('-inf')
+        num_slots = self.scorer_worker.vllm_config.speculative_config.num_lookahead_slots
+
+        for method in proposers_results:
+            method_result = proposers_results[method]
+            # method_result: [[output0, time0], [output1, time1], ...]
+            n = len(method_result)
+
+            all_accelerate_rate = 0
+            for i in range(1, n - num_slots):  
+                proposer_tokens = method_result[i][0].proposal_token_ids[0].tolist()
+                proposer_time = method_result[i][1]
+                
+                scorer_time = method_result[i][1]
+                
+                step_accelerate_rate = 1
+                step_accept_probs = 1
+                for j,token in enumerate(proposer_tokens):
+                    if j == num_slots -1:
+                        step_accelerate_rate += (j+1) * step_accept_probs * token_accept_rate
+                        continue
+                    if token < 0:
+                        token_accept_rate = 0
+                    else:
+                        token_accept_rate = float(scorer_probs[i+j][0][0][token])
+                    step_accelerate_rate += (j+1) * step_accept_probs * (1 - token_accept_rate)
+                    step_accept_probs *= token_accept_rate
+                all_accelerate_rate += step_accept_probs * scorer_probs/ (scorer_time + proposer_time)
+                
+
+            expected_speedup = all_accelerate_rate / (n - num_slots - 1)
+
+            if expected_speedup > best_speedup:
+                best_speedup = expected_speedup
+                best_method = method
+
+        return best_method, best_speedup
+
+    
     @torch.inference_mode()
     def start_worker_execution_loop(self) -> None:
         """Execute model loop to perform speculative decoding
@@ -614,8 +832,9 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         not called, meaning that the kv-cache in proposer for requests is not
         updated, so they cannot enable spec decode in the rest decoding.
         """
-
+        t1 = time.time()
         sampler_output = self.scorer_worker.execute_model(execute_model_req)
+        t2 = time.time()
         assert len(sampler_output) == 1
         sampler_output = sampler_output[0]
 
@@ -655,6 +874,8 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
 
         # Clear device tensors from sampler output. This reduces communication
         # overhead when the engine runs in a different process than the workers.
+        if autospec_no_spec:
+            return sampler_output_to_return,sampler_output.sampled_token_probs, t2 - t1
         sampler_output.sampled_token_probs = None
         sampler_output.sampled_token_ids = None
         sampler_output.logprobs = None
