@@ -1006,7 +1006,84 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
 
         Returns a tuple of Tensors, one for the accepted token ids and one for
         the logprobs according to the scoring model.
+
+        if tree decoding, will return the accepted_ids(list[int]) and None
         """
+        if proposals.is_tree_decoding:
+            best_candidates = [[0] for _ in range(len(seq_group_metadata_list))]
+            accept_token_lens = [1 for _ in range(len(seq_group_metadata_list))]
+            last_accepted_token_ids = [0 for _ in range(len(seq_group_metadata_list))]
+            batch_expand_size = [ len(proposal) + 1 for proposal in proposals.tree_proposals.values()]
+            batch_start_idx = [sum(batch_expand_size[:i]) for i in range(len(batch_expand_size))]
+            sampled_token_ids = proposal_scores.token_ids.squeeze(dim=0)
+            
+            all_used_block_ids = set()
+            for sgm in proposal_scores.expand_seq_group_metadata_list:
+                sgm_seq_id = sgm.get_first_seq_id()
+                sgm_block_tables = sgm.block_tables[sgm_seq_id]
+                all_used_block_ids.update(sgm_block_tables)
+
+            if sampled_token_ids.dim() == 0:
+                sampled_token_ids = sampled_token_ids.unsqueeze(0)
+            
+            for batch_id,sgm in enumerate(seq_group_metadata_list):
+                seq_id = sgm.get_first_seq_id()
+                tree_proposal = proposals.tree_proposals[seq_id]
+                best_candidates[batch_id] = [sampled_token_ids[batch_start_idx[batch_id]].item()]
+                last_accepted_token_ids[batch_id] = sampled_token_ids[batch_start_idx[batch_id]].item()
+                original_seq_id = sgm.get_first_seq_id()
+                for proposal in tree_proposal:
+                    accept_len = 0  
+                    for idx, token in enumerate(proposal):
+                        if not idx:
+                            batch_offset = 0
+                        else:
+                            batch_offset = proposals.prefix_dict[seq_id][tuple(proposal[:idx])]
+                        if idx:
+                            if not list(proposal[:idx]) == next(iter(proposal_scores.expand_seq_group_metadata_list[batch_offset + batch_start_idx[batch_id]].seq_data.values())).get_token_ids()[-idx:]:
+                                print("batch mismatch")
+                        if token == sampled_token_ids[batch_offset + batch_start_idx[batch_id]]:
+                            accept_len += 1
+                        else:
+                            break
+                    if accept_len == len(proposal) and accept_len + 1 > accept_token_lens[batch_id]:
+                        batch_offset = proposals.prefix_dict[seq_id][tuple(proposal)]
+                        #change the seq_data and the block table in block manager.keep the seq_id same
+                        expand_sequence_group_meta_data = proposal_scores.expand_seq_group_metadata_list[batch_start_idx[batch_id] + batch_offset]
+                        new_seq_id = expand_sequence_group_meta_data.get_first_seq_id()
+                        expand_seqence = expand_sequence_group_meta_data.seq_data[new_seq_id]
+                        seq_group_metadata_list[batch_id].seq_data[original_seq_id] = expand_seqence
+                        
+                        
+                        block_table_type = []
+                        for block_id in expand_sequence_group_meta_data.block_tables[new_seq_id]:
+                            block_table_type.append(self.block_manager.block_allocator.get_block_from_block_id(block_id))
+                        
+                        self.block_manager.block_tables[original_seq_id] = BlockTable(
+                            block_size = self.block_manager.block_size,
+                            block_allocator = self.block_manager.block_allocator,
+                            _blocks = block_table_type
+                        )
+
+                        best_candidates[batch_id] = list(proposal) + [sampled_token_ids[batch_offset + batch_start_idx[batch_id]].item()]
+                        accept_token_lens[batch_id] = accept_len + 1
+                        last_accepted_token_ids[batch_id] = sampled_token_ids[batch_offset + batch_start_idx[batch_id]].item()
+            
+            active_block_ids = set()
+            for _ , seq_block_table_type in self.block_manager.block_tables.items():
+                blocks_list = seq_block_table_type._blocks      #List[NaiveBlock]
+                for block in blocks_list:
+                    active_block_ids.add(block._block_id)
+            
+            unused_block_ids = all_used_block_ids - active_block_ids
+            for unused_block_id in unused_block_ids:
+                self.block_manager.block_allocator.free(self.block_manager.block_allocator.get_block_from_block_id(unused_block_id))
+            
+            self.rest_accept_tokens += sum(len(sublist) for sublist in best_candidates)
+            self.rest_decoding_steps += len(best_candidates)
+            #we set disable_logprobs True if use the rest speculation method
+            return best_candidates, None
+        
         proposal_lens_list = proposals.proposal_lens.tolist()
 
         # vLLM currently only supports proposal lens equal to zero or the batch
